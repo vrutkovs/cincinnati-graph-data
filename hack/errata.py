@@ -11,6 +11,7 @@ import os
 import time
 import urllib.parse
 import urllib.request
+from github import Github
 
 
 logging.basicConfig(level=logging.DEBUG)
@@ -38,6 +39,7 @@ def run(poll_period=datetime.timedelta(seconds=3600), cache=None, webhook=None, 
             if cache and message['fulladvisory'] in cache or 'bug fix update' not in message['synopsis']:
                 continue
             notify(message=message, webhook=webhook)
+            lgtm_fast_pr_for_errata(message)
             if cache is not None:
                 cache[message['fulladvisory']] = {
                     'when': message['when'],
@@ -88,6 +90,58 @@ def notify(message, webhook=None):
             'text': '<!subteam^STE7S7ZU2>: {fulladvisory} shipped {when}: {synopsis}'.format(**message),
         },
     }).encode('utf-8'))
+
+
+def get_open_prs_to_fast(repo):
+    pulls = repo.get_pulls(state='open', sort='created', base='master')
+    for pr in pulls:
+        try:
+            # Skip unknown PRs
+            if not pr.title.startswith("Enable "):
+                continue
+            # Ignore PRs which don't target fast
+            if pr.title.split(" ")[3] != "fast":
+                continue
+            yield pr.number, pr.body
+        except Exception as e:
+            print(f"Failed to parse {pr.number}: {e}")
+
+
+def extract_errata_number_from_body(body):
+    ERRATA_MARKER = 'https://errata.devel.redhat.com/advisory/'
+    first_line = body.split('\n')[0]
+    links = [
+        x for x in first_line.split(' ') if x.startswith(ERRATA_MARKER)
+    ]
+    if len(links) == 0:
+        return None
+    errata_num = links[0].split('/')[-1]
+
+    try:
+        return int(errata_num)
+    except ValueError:
+        return None
+
+
+def lgtm_fast_pr_for_errata(message):
+    github_token = os.environ.get("GITHUB_TOKEN")
+    if not github_token:
+        print(f"Skipping fast PR check: no github token set")
+        return
+
+    github_object = Github(github_token)
+    repo = github_object.get_repo("openshift/cincinnati-graph-data")
+
+    for pr_number, body in get_open_prs_to_fast(repo):
+        errata_num = extract_errata_number_from_body(body)
+        if not errata_num or errata_num != message.get('errata_id'):
+            continue
+
+        print(f"Found PR #{pr_number} promoting to fast for {errata_num}")
+        msg = "Autoapproving PR to fast after the errata has shipped\n/lgtm"
+        pr = repo.get_pull(pr_number)
+        pr.create_issue_comment(msg)
+        print(f"Commented in {pr.url}")
 
 
 if __name__ == '__main__':
