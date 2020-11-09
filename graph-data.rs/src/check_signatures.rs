@@ -1,19 +1,23 @@
 use anyhow::Result as Fallible;
 use anyhow::{format_err, Context};
 use futures::stream::{FuturesOrdered, StreamExt};
+use gpgrv::{verify_message, Keyring};
 use lazy_static::lazy_static;
 use reqwest::{Client, ClientBuilder};
 use semver::Version;
 use std::collections::HashSet;
+use std::fs::{read_dir, File};
+use std::io::{BufReader, Seek, SeekFrom};
 use std::ops::Range;
 use std::str::FromStr;
 use std::time::Duration;
+use tempfile::tempfile;
 use url::Url;
 
 use cincinnati::plugins::prelude_plugin_impl::TryFutureExt;
 use cincinnati::Release;
-// base url for signature storage - see https://github.com/openshift/cluster-update-keys/blob/master/stores/store-openshift-official-release-mirror
 lazy_static! {
+  // base url for signature storage - see https://github.com/openshift/cluster-update-keys/blob/master/stores/store-openshift-official-release-mirror
   static ref BASE_URL: Url =
     Url::parse("https://mirror.openshift.com/pub/openshift-v4/signatures/openshift/release/")
       .expect("could not parse url");
@@ -39,6 +43,26 @@ static SKIP_VERSIONS: &[&str] = &[
   "4.6.0-fc.3+s390x",
 ];
 
+// Location of public keys
+static PUBKEYS_DIR: &str = "/usr/local/share/public-keys/";
+
+// Signature format
+#[derive(Deserialize, Serialize)]
+struct SignatureImage {
+  #[serde(rename = "docker-manifest-digest")]
+  digest: String,
+}
+
+#[derive(Deserialize, Serialize)]
+struct SignatureCritical {
+  image: SignatureImage,
+}
+
+#[derive(Deserialize, Serialize)]
+struct Signature {
+  critical: SignatureCritical,
+}
+
 fn payload_from_release(release: &Release) -> Fallible<String> {
   match release {
     Release::Concrete(c) => Ok(c.payload.clone()),
@@ -46,7 +70,7 @@ fn payload_from_release(release: &Release) -> Fallible<String> {
   }
 }
 
-async fn fetch_url(client: &Client, sha: &str, i: u64) -> Fallible<()> {
+async fn fetch_url(client: &Client, sha: &str, i: u64) -> Fallible<String> {
   let url = BASE_URL
     .join(format!("{}/", sha.replace(":", "=")).as_str())?
     .join(format!("signature-{}", i).as_str())?;
@@ -59,12 +83,32 @@ async fn fetch_url(client: &Client, sha: &str, i: u64) -> Fallible<()> {
   let url_s = url.to_string();
   let status = res.status();
   match status.is_success() {
-    true => Ok(()),
+    true => Ok(res.text().await?),
     false => Err(format_err!("Error fetching {} - {}", url_s, status)),
   }
 }
 
-async fn find_signatures_for_version(client: &Client, release: &Release) -> Fallible<()> {
+async fn verify_signature(keyring: &Keyring, body: &str, digest: &str) -> Fallible<()> {
+  let mut temp = tempfile().context("Creating temp file for signature")?;
+  verify_message(body.as_bytes(), &mut temp, keyring).context("Verifying signature")?;
+  temp.seek(SeekFrom::Start(0)).unwrap();
+  let signature: Signature = serde_json::from_reader(temp).context("Deserializing message")?;
+  let actual_digest = signature.critical.image.digest;
+  if actual_digest == digest {
+    Ok(())
+  } else {
+    return Err(format_err!(
+      "Valid signature, but digest mismatches: {}",
+      actual_digest
+    ));
+  }
+}
+
+async fn find_signatures_for_version(
+  client: &Client,
+  keyring: &Keyring,
+  release: &Release,
+) -> Fallible<()> {
   let mut errors = vec![];
   let payload = payload_from_release(release)?;
   let digest = payload
@@ -79,12 +123,15 @@ async fn find_signatures_for_version(client: &Client, release: &Release) -> Fall
   loop {
     if let Some(i) = attempts.next() {
       match fetch_url(client, digest, i).await {
-        Ok(_) => return Ok(()),
+        Ok(body) => match verify_signature(&keyring, body.as_str(), digest).await {
+          Ok(_) => return Ok(()),
+          Err(e) => errors.push(e),
+        },
         Err(e) => errors.push(e),
       }
     } else {
       return Err(format_err!(
-        "Failed to find signatures for {} - {}: {:#?}",
+        "Failed to verify signature for {} - {}: {:#?}",
         release.version(),
         payload,
         errors
@@ -109,11 +156,30 @@ fn is_release_in_versions(versions: &HashSet<Version>, release: &Release) -> boo
   versions.contains(&version)
 }
 
+fn add_public_keys_to_keyring(keyring: &mut Keyring) -> Fallible<()> {
+  for entry in read_dir(PUBKEYS_DIR).context("Reading public keys dir")? {
+    let path = &entry?.path();
+    let path_str = match path.to_str() {
+      None => continue,
+      Some(p) => p,
+    };
+    let input = BufReader::new(File::open(path).context(format!("Reading {}", path_str))?);
+    keyring
+      .append_keys_from_armoured(input)
+      .context(format!("Appending {}", path_str))?;
+  }
+  Ok(())
+}
+
 pub async fn run(
   releases: &Vec<Release>,
   found_versions: &HashSet<semver::Version>,
 ) -> Fallible<()> {
   println!("Checking release signatures");
+
+  // Initialize keyring
+  let mut keyring = Keyring::new();
+  add_public_keys_to_keyring(&mut keyring)?;
 
   let client: Client = ClientBuilder::new()
     .gzip(true)
@@ -130,7 +196,7 @@ pub async fn run(
   let results: Vec<Fallible<()>> = tracked_versions
     //Attempt to find signatures for filtered releases
     .into_iter()
-    .map(|ref r| find_signatures_for_version(&client, r))
+    .map(|ref r| find_signatures_for_version(&client, &keyring, r))
     .collect::<FuturesOrdered<_>>()
     .collect::<Vec<Fallible<()>>>()
     .await

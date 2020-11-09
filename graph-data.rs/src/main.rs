@@ -2,6 +2,9 @@ mod check_releases;
 mod check_signatures;
 mod verify_yaml;
 
+#[macro_use]
+extern crate serde_derive;
+
 use anyhow::Result as Fallible;
 
 use cincinnati::Release;
